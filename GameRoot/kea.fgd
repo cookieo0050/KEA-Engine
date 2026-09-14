@@ -1,0 +1,60 @@
+﻿// ============================================================================
+// kea.fgd - KEA Engine entity definition file
+// ============================================================================
+// TrenchBroom-compatible FGD (Forge Game Data). Referenced from
+// GameConfig.cfg so TrenchBroom shows KEA's entity classes in the browser
+// and previews the mesh models referenced by the "model" property.
+//
+// Conventions:
+//   - Mesh models live in GameRoot/models/ and are referenced relative to it,
+//     e.g. "props/barrel.obj" resolves to GameRoot/models/props/barrel.obj.
+//   - A mesh-spawning entity is any @PointClass whose "model" key is set.
+//     KEA spawns it at "origin" using "angle"/"angles" rotation and "scale".
+//   - The model({ "path": model, "scale": scale }) option tells TrenchBroom
+//     to preview whatever path the designer typed into the "model" property.
+//   - Keyvalue field order follows TrenchBroom: key(type) : "Display Name" :
+//     default : "Help". An empty slot is a bare ':'.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Base classes (shared property bundles)
+// ----------------------------------------------------------------------------
+
+@BaseClass = Targetname : "Targetname" [
+    targetname(target_destination) : "Target Name" : : "Unique name used to identify this entity."
+]
+
+@BaseClass = Target : "Target" [
+    target(target_destination) : "Target" : : "Name of the entity this one points to."
+]
+
+@BaseClass base(Targetname, Target) = Spawnflags : "Spawn flags" [
+    spawnflags(flags) = [
+        1 : "Not in shadows" : 0
+        2 : "No shadow cast" : 0
+    ]
+]
+
+// ----------------------------------------------------------------------------
+// Point entities
+// ----------------------------------------------------------------------------
+
+@PointClass base(Targetname) size(-16 -16 -16, 16 16 16) color(0 255 0) = info_player_start : "Player Start" [
+    origin(origin) : "Origin" : : "Spawn position."
+    angle(angle) : "Yaw" : : "Facing direction (0-360)."
+]
+
+@PointClass base(Targetname) size(-16 -16 -16, 16 16 16) color(255 255 128) = light : "Point Light" [
+    origin(origin) : "Origin" : : "Light position."
+    color(color255) : "Color" : "0.9 0.85 0.7" : "RGB color, either 0-1 floats (0.9 0.85 0.7) or 0-255 (191, 38, 186)."
+    intensity(string) : "Intensity" : 3 : "Brightness."
+    radius(string) : "Radius" : 300 : "Falloff radius in map units."
+]
+
+@PointClass base(Targetname, Spawnflags) size(-8 -8 -8, 8 8 8) color(0 255 255) model({ "path": model, "scale": scale }) = func_model : "Mesh Model" [
+    model(string) : "Model file" : : "Mesh path relative to GameRoot/models/, e.g. props/barrel.obj."
+    origin(origin) : "Origin" : : "Placement position."
+    angle(angle) : "Yaw" : : "Single-axis yaw (Quake style). Overridden by angles."
+    angles(angle) : "Pitch Yaw Roll" : : "Full orientation (P Y R). Overrides angle."
+    scale(string) : "Scale" : 1 : "Uniform scale factor."
+]
