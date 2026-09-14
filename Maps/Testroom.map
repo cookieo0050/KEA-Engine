@@ -3044,7 +3044,7 @@
 // entity 1
 {
 "classname" "info_player_start"
-"origin" "4.48 3.1 166.28"
+"origin" "-1316.755127 -306.920502 -164.225906"
 "angles" "0.306 -0.392 -0.772"
 }
 // entity 2
@@ -3119,3 +3119,4 @@
 "intensity" "3"
 "radius" "300"
 }
+

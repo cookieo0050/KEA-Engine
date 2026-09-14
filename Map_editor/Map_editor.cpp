@@ -38,8 +38,10 @@
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <cctype>
 #include <random>
 #include <algorithm>
+#include <functional>
 #include <glm/gtc/quaternion.hpp>
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -49,6 +51,7 @@
 #include "mapfile.h"
 #include "texture.h"
 #include "fgd.h"
+#include "objmesh.h"
 #include "renderpipeline.h"
 using namespace std;
 
@@ -70,8 +73,51 @@ static string workspaceRoot() {
 
 const string MAP_PATH = workspaceRoot() + "/Maps/Testroom.map";
 const string TEXTURES_FOLDER = workspaceRoot() + "/GameRoot/textures/";
+const string MODELS_FOLDER = workspaceRoot() + "/GameRoot/models/";
 const string FONT_PATH = workspaceRoot() + "/oldschool_pc_font_pack_v2.2_FULL/ttf - Px (pixel outline)/Px437_IBM_VGA_8x16.ttf";
 const string DBG_LOG = workspaceRoot() + "/x64/Debug/editor_dbg.txt";
+
+// Last-write time of a file (FILETIME -> uint64). Used by hot-reload to detect
+// when the .map on disk changed without polling file size/contents.
+static ULONGLONG fileWriteTimeOf(const string& path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) return 0;
+    return ((ULONGLONG)fad.ftLastWriteTime.dwHighDateTime << 32)
+        | fad.ftLastWriteTime.dwLowDateTime;
+}
+
+// Recursively collect relative .obj paths under MODELS_FOLDER ("props/crate.obj")
+// for the model-key combo in the Properties panel.
+static vector<string> collectObjModelPaths() {
+    vector<string> out;
+    std::function<void(const string&, const string&)> walk =
+        [&](const string& dir, const string& prefix) {
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA((dir + "*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            string name = fd.cFileName;
+            if (name == "." || name == "..") continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                walk(dir + name + "\\", prefix + name + "/");
+            else {
+                string lower = name;
+                for (char& c : lower) c = (char)tolower((unsigned char)c);
+                if (lower.size() > 4 && lower.substr(lower.size() - 4) == ".obj")
+                    out.push_back(prefix + name);
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    };
+    walk(MODELS_FOLDER, "");
+    return out;
+}
+
+// Cache of relative .obj paths for the model-key combo in Properties (scanned once).
+static const vector<string>& cachedObjModelPaths() {
+    static vector<string> paths = collectObjModelPaths();
+    return paths;
+}
 
 struct EditorCamera {
     glm::vec3 position = glm::vec3(0.0f, 8.0f, 0.0f);
@@ -128,8 +174,21 @@ struct EditorSettings {
     bool snapEnabled = true;
     int  gizmoOp = 0;      // 0 translate, 1 rotate, 2 scale
     bool gizmoLocal = false;
+    float snapTranslate = 1.0f;  // grid step in map units (gizmo TRANSLATE)
+    float snapRotate = 15.0f;    // degrees (gizmo ROTATE)
+    float snapScale = 0.1f;      // scale step (gizmo SCALE)
+    bool showGrid = true;
+    bool wireframe = false;
+    bool ortho = false;
+    bool autoReload = false;     // hot-reload the .map when it changes on disk
 };
 static EditorSettings s_editorSettings;
+
+// Last observed .map write time (hot-reload detection) + a toggle for the
+// snap-settings dockable panel (opened by View->Snap Settings).
+static ULONGLONG g_mapWriteTime = fileWriteTimeOf(MAP_PATH);
+static bool s_snapPanelOpen = false;
+static double g_lastReloadCheck = 0.0;
 
 static void* EditorSettings_ReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char* name) {
     return (void*)&s_editorSettings;
@@ -141,11 +200,21 @@ static void EditorSettings_ReadLine(ImGuiContext*, ImGuiSettingsHandler*, void* 
     if (sscanf_s(line, "Snap=%d", &v) == 1) s->snapEnabled = (v != 0);
     else if (sscanf_s(line, "Op=%d", &v) == 1) s->gizmoOp = v < 0 ? 0 : (v > 2 ? 2 : v);
     else if (sscanf_s(line, "Local=%d", &v) == 1) s->gizmoLocal = (v != 0);
+    else if (sscanf_s(line, "SnapT=%f", &s->snapTranslate) == 1) {}
+    else if (sscanf_s(line, "SnapR=%f", &s->snapRotate) == 1) {}
+    else if (sscanf_s(line, "SnapS=%f", &s->snapScale) == 1) {}
+    else if (sscanf_s(line, "Grid=%d", &v) == 1) s->showGrid = (v != 0);
+    else if (sscanf_s(line, "Wire=%d", &v) == 1) s->wireframe = (v != 0);
+    else if (sscanf_s(line, "Ortho=%d", &v) == 1) s->ortho = (v != 0);
+    else if (sscanf_s(line, "AutoReload=%d", &v) == 1) s->autoReload = (v != 0);
 }
 
 static void EditorSettings_WriteAll(ImGuiContext*, ImGuiSettingsHandler*, ImGuiTextBuffer* out_buf) {
-    out_buf->appendf("[Editor][Settings]\nSnap=%d\nOp=%d\nLocal=%d\n\n",
-        s_editorSettings.snapEnabled ? 1 : 0, s_editorSettings.gizmoOp, s_editorSettings.gizmoLocal ? 1 : 0);
+    out_buf->appendf("[Editor][Settings]\nSnap=%d\nOp=%d\nLocal=%d\nSnapT=%.3f\nSnapR=%.3f\nSnapS=%.3f\nGrid=%d\nWire=%d\nOrtho=%d\nAutoReload=%d\n\n",
+        s_editorSettings.snapEnabled ? 1 : 0, s_editorSettings.gizmoOp, s_editorSettings.gizmoLocal ? 1 : 0,
+        s_editorSettings.snapTranslate, s_editorSettings.snapRotate, s_editorSettings.snapScale,
+        s_editorSettings.showGrid ? 1 : 0, s_editorSettings.wireframe ? 1 : 0,
+        s_editorSettings.ortho ? 1 : 0, s_editorSettings.autoReload ? 1 : 0);
 }
 
 static void EditorSettings_Register() {
@@ -1008,6 +1077,144 @@ static bool saveEntityPropsToMap(const string& mapPath,
 }
 
 // ----------------------------------------------------------------------------
+// Persist arbitrary keyvalue edits (add / delete / retype) made from the
+// generic entity Properties panel. Only entities flagged dirty in `propsDirty`
+// are rewritten; structural keys (classname plus everything another save path
+// already manages: origin/angles/angle/scale + light color/intensity/radius)
+// pass through untouched so those rewriters stay the single source of truth.
+// Entities added in the editor that have no block in the file yet get a full
+// block serialized at the end of the .map. Mirrors the depth walking of the
+// two helpers above ('{' at depth 1 opens an entity, '}' at depth 1 closes).
+// ----------------------------------------------------------------------------
+static bool saveGenericKeysToMap(const string& mapPath,
+                                 const vector<MapEntity>& entities,
+                                 const vector<bool>& propsDirty) {
+    static const char* structuralKeys[] = {
+        "classname", "origin", "angles", "angle", "scale",
+        "color", "intensity", "radius"
+    };
+    auto isStructural = [](const string& key) -> bool {
+        for (const char* k : structuralKeys)
+            if (key == k) return true;
+        return false;
+    };
+
+    ifstream in(mapPath, ios::binary);
+    if (!in) return false;
+    vector<string> lines;
+    string line;
+    while (getline(in, line)) lines.push_back(line);
+    in.close();
+
+    bool crlf = false;
+    for (const string& l : lines)
+        if (!l.empty()) { crlf = (l.back() == '\r'); break; }
+
+    auto isClosingBrace = [](const string& s) {
+        size_t b = s.find_first_not_of(" \t\r\n");
+        if (b == string::npos) return false;
+        size_t e = s.find_last_not_of(" \t\r\n");
+        return s.substr(b, e - b + 1) == "}";
+    };
+
+    // Pull the key out of a `"key" "value"` line ("" when not a keyvalue).
+    auto lineKey = [](const string& l) -> string {
+        size_t q1 = l.find('"');
+        size_t q2 = q1 == string::npos ? string::npos : l.find('"', q1 + 1);
+        if (q1 == string::npos || q2 == string::npos) return "";
+        return l.substr(q1 + 1, q2 - q1 - 1);
+    };
+
+    vector<string> out;
+    out.reserve(lines.size() + 64);
+    vector<bool> sawBlock(entities.size(), false);
+    int depth = 0;
+    int entityIndex = -1;
+    for (size_t i = 0; i < lines.size(); i++) {
+        const string& raw = lines[i];
+        string t = raw;
+        size_t bs = t.find_first_not_of(" \t\r\n");
+        if (bs == string::npos) { out.push_back(raw); continue; }
+        size_t be = t.find_last_not_of(" \t\r\n");
+        t = t.substr(bs, be - bs + 1);
+
+        if (t == "{") {
+            depth++;
+            if (depth == 1) {
+                entityIndex++;
+                if (entityIndex < (int)entities.size() && entityIndex < (int)propsDirty.size()
+                    && propsDirty[entityIndex]) {
+                    const MapEntity& ent = entities[entityIndex];
+                    out.push_back(raw);
+                    sawBlock[entityIndex] = true;
+                    i++;
+
+                    // Collect the block interior once so we can rewrite existing
+                    // generic key lines, drop deleted ones, and splice new keys
+                    // in after the last existing keyvalue (before any brushes).
+                    vector<string> block;
+                    while (i < lines.size() && !isClosingBrace(lines[i]))
+                        block.push_back(lines[i++]);
+
+                    vector<string> newBlock;
+                    size_t lastKv = 0;      // index in newBlock after the last keyvalue
+                    for (const string& l : block) {
+                        string key = lineKey(l);
+                        if (key.empty() || isStructural(key)) { newBlock.push_back(l); continue; }
+                        auto propIt = ent.properties.find(key);
+                        if (propIt == ent.properties.end()) continue;   // deleted in panel
+                        newBlock.push_back("\"" + key + "\" \"" + propIt->second + "\"" + (crlf ? "\r" : ""));
+                        lastKv = newBlock.size();
+                    }
+
+                    // New keys added in the panel: sorted insert after last keyvalue.
+                    vector<pair<string, string>> fresh;
+                    for (auto& kv : ent.properties) {
+                        if (isStructural(kv.first)) continue;
+                        bool present = false;
+                        for (const string& l : block)
+                            if (lineKey(l) == kv.first) { present = true; break; }
+                        if (!present) fresh.emplace_back(kv.first, kv.second);
+                    }
+                    std::sort(fresh.begin(), fresh.end());
+                    vector<string> inserts;
+                    for (auto& f : fresh)
+                        inserts.push_back("\"" + f.first + "\" \"" + f.second + "\"" + (crlf ? "\r" : ""));
+                    newBlock.insert(newBlock.begin() + lastKv, inserts.begin(), inserts.end());
+                    for (auto& nl : newBlock) out.push_back(nl);
+
+                    if (i < lines.size()) { depth--; out.push_back(lines[i]); }
+                    continue;
+                }
+            }
+        }
+        else if (t == "}") depth--;
+        out.push_back(raw);
+    }
+
+    // Append entities the editor created that have no block in the file yet.
+    for (size_t i = 0; i < entities.size(); i++) {
+        if (i >= propsDirty.size() || !propsDirty[i] || sawBlock[i]) continue;
+        out.push_back("{" + string(crlf ? "\r" : ""));
+        out.push_back("\"classname\" \"" + entities[i].classname + "\"" + (crlf ? "\r" : ""));
+        for (auto& kv : entities[i].properties)
+            out.push_back("\"" + kv.first + "\" \"" + kv.second + "\"" + (crlf ? "\r" : ""));
+        out.push_back("}" + string(crlf ? "\r" : ""));
+    }
+
+    string tmpPath = mapPath + ".tmp";
+    {
+        ofstream fout(tmpPath, ios::binary | ios::trunc);
+        if (!fout) return false;
+        for (size_t i = 0; i < out.size(); i++)
+            fout << out[i] << "\n";
+    }
+    if (remove(mapPath.c_str()) != 0) return false;
+    if (rename(tmpPath.c_str(), mapPath.c_str()) != 0) return false;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
 // Unity-style dark editor theme. Mirrors Unity's "Pro" skin: flat charcoal
 // surfaces, light-gray text, and a single blue accent used for selection and
 // active controls. Everything is kept plain and uncluttered.
@@ -1144,6 +1351,7 @@ struct EditorStateSnapshot {
     PostProcessState postState;
     std::vector<bool> lightDirty;
     std::vector<bool> entityDirty;
+    std::vector<bool> propsDirty;
 };
 
 int main() {
@@ -1241,13 +1449,18 @@ int main() {
     // the Save button can write the new "origin" keyvalue back into the .map.
     vector<bool> entityDirty(level.entities.size(), false);
 
+    // Any entity whose keyvalues were edited/added/removed via the generic
+    // Properties panel is flagged here so Save writes those arbitrary keys.
+    vector<bool> propsDirty(level.entities.size(), false);
+
     // Live engine-space position for a point entity (drives its viewport marker
     // and the gizmo). Lights and the player start keep a live engine copy that
     // the panel/gizmo both edit; other entities read their .map "origin" key.
     auto entityEnginePos = [&](int idx) -> glm::vec3 {
+        if (idx < 0 || idx >= (int)level.entities.size()) return glm::vec3(0.0f);
         const MapEntity& ent = level.entities[idx];
         if (ent.classname == "light") {
-            for (size_t k = 0; k < lightEntityIndices.size(); k++)
+            for (size_t k = 0; k < lightEntityIndices.size() && k < level.pointLights.size(); k++)
                 if (lightEntityIndices[k] == idx) return level.pointLights[k].position;
         }
         if (ent.classname == "info_player_start") return level.playerStart;
@@ -1346,6 +1559,36 @@ int main() {
         }
     }
 
+    // OBJ previews for mesh entities (FGD "model" key). Loaded once on the GL
+    // context: the mesh stays in model space and is transformed by the same
+    // translate * rotate * scale matrix the markers/gizmo use. reloadEntityModel()
+    // re-reads the entity's "model" keyvalue and rebuilds the preview so the
+    // Properties panel / duplicate / hot-reload all reuse one code path.
+    vector<ObjMesh> entityModels(level.entities.size());
+    vector<bool> entityHasModel(level.entities.size(), false);
+    auto reloadEntityModel = [&](int idx) {
+        if (idx < 0 || idx >= (int)entityModels.size()) return;
+        if (entityHasModel[idx]) {
+            entityModels[idx].freeGPU();
+            entityHasModel[idx] = false;
+        }
+        const MapEntity& ent = level.entities[idx];
+        const FgdClass* cls = fgd.find(ent.classname);
+        if (!cls || cls->modelPathKey.empty()) return;
+        auto mit = ent.properties.find(cls->modelPathKey);
+        if (mit == ent.properties.end() || mit->second.empty()) return;
+        string meshPath = MODELS_FOLDER + mit->second;
+        if (entityModels[idx].loadFromObj(meshPath, TEXTURES_FOLDER) && entityModels[idx].uploadToGPU()) {
+            entityHasModel[idx] = true;
+            cout << "Editor: model preview loaded -> " << meshPath << "\n";
+        }
+        else {
+            cerr << "Editor: failed to load model '" << meshPath << "': "
+                << entityModels[idx].error << "\n";
+        }
+    };
+    for (size_t i = 0; i < level.entities.size(); i++) reloadEntityModel((int)i);
+
     // Write a quaternion back to the .map "angles" keyvalue ("Pitch Yaw Roll"
     // in map space) and drop any stale single "angle" key so the two can't
     // disagree. Also caches the quaternion for the gizmo/marker.
@@ -1394,6 +1637,55 @@ int main() {
             cout << "Light #" << k << ": normalized 0-255 color to " << fmt3(norm) << "\n";
         }
     }
+
+    // Recompute the cached rotation/scale (and light state) from the .map key
+    // strings after a raw Properties-panel edit, so markers, gizmo and model
+    // previews follow immediately. Mirrors the entityRot init logic above.
+    auto refreshEntityFromKeys = [&](int idx) {
+        if (idx < 0 || idx >= (int)level.entities.size()) return;
+        const MapEntity& ent = level.entities[idx];
+        auto ait = ent.properties.find("angles");
+        if (ait != ent.properties.end()) {
+            vector<float> a = parseVec3(ait->second);
+            if (a.size() >= 3) entityRot[idx] = eulerToQuat(a[0], a[1], -a[2]);
+            else if (a.size() >= 1) entityRot[idx] = eulerToQuat(0.0f, a[0], 0.0f);
+        }
+        else {
+            auto git = ent.properties.find("angle");
+            if (git != ent.properties.end())
+                entityRot[idx] = eulerToQuat(0.0f, parseAngleValue(git->second, 0.0f), 0.0f);
+        }
+        auto sit = ent.properties.find("scale");
+        if (sit != ent.properties.end()) {
+            float sc = parseAngleValue(sit->second, 1.0f);
+            entityScale[idx] = sc > 0.0001f ? sc : 1.0f;
+        }
+        if (ent.classname == "light") {
+            for (size_t k = 0; k < lightEntityIndices.size() && k < level.pointLights.size(); k++) {
+                if (lightEntityIndices[k] == idx) {
+                    PointLight& pl = level.pointLights[k];
+                    auto cit = ent.properties.find("color");
+                    if (cit != ent.properties.end()) {
+                        glm::vec3 c = parseColorFromString(cit->second);
+                        if (c.x > 1.01f || c.y > 1.01f || c.z > 1.01f) c /= 255.0f;
+                        pl.color = glm::clamp(c, 0.0f, 1.0f);
+                    }
+                    auto iit = ent.properties.find("intensity");
+                    if (iit != ent.properties.end()) {
+                        vector<float> v = parseVec3(iit->second);
+                        if (!v.empty()) pl.intensity = v[0];
+                    }
+                    auto rit = ent.properties.find("radius");
+                    if (rit != ent.properties.end()) {
+                        vector<float> v = parseVec3(rit->second);
+                        if (!v.empty()) pl.radius = v[0] * MAP_SCALE;
+                    }
+                    lightDirty[k] = true;
+                    break;
+                }
+            }
+        }
+    };
 
     LightingState lighting;
     loadLightingSidecar(MAP_PATH, lighting);
@@ -1628,6 +1920,7 @@ int main() {
         s.postState = postState;
         s.lightDirty = lightDirty;
         s.entityDirty = entityDirty;
+        s.propsDirty = propsDirty;
         return s;
     };
     auto restoreState = [&](const EditorStateSnapshot& s) {
@@ -1641,6 +1934,7 @@ int main() {
         postState = s.postState;
         lightDirty = s.lightDirty;
         entityDirty = s.entityDirty;
+        propsDirty = s.propsDirty;
     };
     auto pushUndoState = [&](const EditorStateSnapshot& s) {
         undoStack.push_back(s);
@@ -1660,6 +1954,352 @@ int main() {
         undoStack.push_back(captureState());
         restoreState(redoStack.back());
         redoStack.pop_back();
+    };
+
+    // Create a brand-new entity from an FGD class and drop it next to the
+    // camera. FGD defaults (including keys inherited from base(...) classes)
+    // are applied, the parallel per-entity vectors are kept in sync, and the
+    // entity is flagged so the next Save appends its block to the .map.
+    auto addEntityFromClass = [&](const FgdClass& cls) {
+        MapEntity ent;
+        ent.classname = cls.name;
+
+        // Flatten the class key list (the parser stores only base() names).
+        vector<const FgdKeyValue*> classKeys;
+        for (const FgdKeyValue& kv : cls.keyValues) classKeys.push_back(&kv);
+        for (const string& b : cls.baseClasses) {
+            const FgdClass* base = fgd.find(b);
+            if (base)
+                for (const FgdKeyValue& kv : base->keyValues) classKeys.push_back(&kv);
+        }
+        for (const FgdKeyValue* kv : classKeys)
+            if (ent.properties.count(kv->key) == 0 && !kv->defaultValue.empty())
+                ent.properties[kv->key] = kv->defaultValue;
+
+        // Place a couple of metres in front of the camera (engine -> map units).
+        glm::vec3 enginePos = camera.position + camera.front * 3.0f;
+        ent.properties["origin"] = formatVec3(engineToMapOrigin(enginePos));
+        if (cls.name == "info_player_start")
+            ent.properties["angle"] = fmtDeg(camera.yaw);
+
+        pushUndo();
+        level.entities.push_back(ent);
+        entityRot.push_back(glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+        entityScale.push_back(1.0f);
+        entityDirty.push_back(false);
+        propsDirty.push_back(true);
+        entityModels.push_back(ObjMesh());
+        entityHasModel.push_back(false);
+
+        int idx = (int)level.entities.size() - 1;
+        if (cls.name == "light") {
+            ent.properties["color"] = "0.9 0.85 0.7";
+            ent.properties["intensity"] = "3";
+            ent.properties["radius"] = "300";
+            PointLight pl;
+            pl.position = enginePos;
+            pl.color = glm::vec3(0.9f, 0.85f, 0.7f);
+            pl.intensity = 3.0f;
+            pl.radius = 300.0f * MAP_SCALE;
+            level.pointLights.push_back(pl);
+            lightEntityIndices.push_back(idx);
+            lightDirty.push_back(true);
+        }
+        else if (cls.name == "info_player_start") {
+            level.playerStart = enginePos;
+            level.hasPlayerStart = true;
+        }
+        selectOnly(idx);
+        cout << "Editor: added entity '" << cls.name << "' (index " << idx << ")\n";
+    };
+
+    // ------------------------------------------------------------------
+    // High-level edit actions shared by the menu bar, toolbar and hotkeys.
+    // Sorting must happen BEFORE entities are removed so the delete loop can
+    // erase in descending index order (erasing a low index shifts everything
+    // above it; erasing high-to-low keeps all remaining indices valid).
+    // ------------------------------------------------------------------
+    auto sortDescending = [](vector<int>& v) {
+        sort(v.begin(), v.end(), std::greater<int>());
+    };
+
+    // Persist every pending edit: the lighting sidecar (sun/ambient), point
+    // light keyvalues, entity transforms ("origin"/"angles"/"scale") and
+    // generic keyvalues. Mirrors the Lighting panel's Save button so Ctrl+S
+    // and menu File->Save behave identically.
+    auto saveAll = [&]() {
+        saveLightingSidecar(MAP_PATH, lighting);
+        bool okL = saveLightEntitiesToMap(MAP_PATH, level.entities, lightEntityIndices, lightDirty);
+        bool okE = saveEntityPropsToMap(MAP_PATH, level.entities, entityDirty);
+        bool okG = saveGenericKeysToMap(MAP_PATH, level.entities, propsDirty);
+        cout << "Save: sidecar written, .map light entities "
+            << (okL ? "updated" : "FAILED") << ", entity transforms "
+            << (okE ? "updated" : "FAILED") << ", generic properties "
+            << (okG ? "updated" : "FAILED") << "\n";
+    };
+
+    // Select every non-worldspawn entity (Ctrl+A / menu Edit->Select All).
+    auto selectAllEntities = [&]() {
+        vector<int> all;
+        for (size_t i = 1; i < level.entities.size(); i++)  // skip worldspawn (idx 0)
+            all.push_back((int)i);
+        setSelection(all);
+    };
+
+    // Delete selected entities (worldspawn is protected). The .map files
+    // themselves are never rewritten to drop blocks - only keyvalues inside
+    // existing blocks are - so deleted entities' blocks stay in the file.
+    auto deleteSelectedEntities = [&]() {
+        if (selection.empty()) return;
+        pushUndo();
+        vector<int> doomed = selection;
+        sortDescending(doomed);
+
+        for (int idx : doomed) {
+            if (idx <= 0 || idx >= (int)level.entities.size()) continue;
+            const string& cls = level.entities[idx].classname;
+            if (cls == "worldspawn") continue;
+
+            // Free the OBJ preview on the GL context so the VBO/VAO aren't leaked.
+            if (idx < (int)entityHasModel.size() && entityHasModel[idx])
+                entityModels[idx].freeGPU();
+
+            // If the deleted entity is a light, also remove its slot from
+            // level.pointLights[] and the parallel lightEntityIndices[].
+            if (cls == "light") {
+                for (size_t k = 0; k < lightEntityIndices.size(); k++) {
+                    if (lightEntityIndices[k] == idx) {
+                        level.pointLights.erase(level.pointLights.begin() + k);
+                        lightEntityIndices.erase(lightEntityIndices.begin() + k);
+                        lightDirty.erase(lightDirty.begin() + k);
+                        break;
+                    }
+                }
+            }
+
+            if (level.entities[idx].classname == "info_player_start") {
+                level.hasPlayerStart = false;
+                level.playerStart = glm::vec3(0.0f);
+            }
+
+            level.entities.erase(level.entities.begin() + idx);
+            entityRot.erase(entityRot.begin() + idx);
+            entityScale.erase(entityScale.begin() + idx);
+            entityDirty.erase(entityDirty.begin() + idx);
+            propsDirty.erase(propsDirty.begin() + idx);
+            entityModels.erase(entityModels.begin() + idx);
+            entityHasModel.erase(entityHasModel.begin() + idx);
+
+            // Every remaining light whose entity index sat above the erased one
+            // shifted down by one - remap now so future lookups stay valid.
+            for (size_t k = 0; k < lightEntityIndices.size(); k++)
+                if (lightEntityIndices[k] > idx) lightEntityIndices[k]--;
+        }
+        clearSelection();
+        cout << "Editor: deleted " << doomed.size() << " entit(y/ies). "
+            "NOTE: in-memory only - the .map file keeps the block until hand-edited.\n";
+    };
+
+    // Duplicate each selected entity with a 2-unit engine-space offset (nudge).
+    // Duplicates push undo (capture happened before add) and are marked dirty so
+    // the next Save appends them. A duplicated light copies its point light.
+    auto duplicateSelectedEntities = [&]() {
+        if (selection.empty()) return;
+        pushUndo();
+        vector<int> added;
+        vector<int> src = selection;
+        for (int idx : src) {
+            if (idx < 0 || idx >= (int)level.entities.size()) continue;
+            const MapEntity& srcEnt = level.entities[idx];
+            if (srcEnt.classname == "worldspawn") continue;
+
+            MapEntity copy = srcEnt;
+            glm::vec3 pos = entityEnginePos(idx) + glm::vec3(2.0f, 0.0f, 0.0f);
+            copy.properties["origin"] = formatVec3(engineToMapOrigin(pos));
+
+            level.entities.push_back(copy);
+            entityRot.push_back(entityRot[idx]);
+            entityScale.push_back(entityScale[idx]);
+            entityDirty.push_back(true);
+            propsDirty.push_back(true);
+            entityModels.push_back(ObjMesh());
+            entityHasModel.push_back(false);
+
+            int nidx = (int)level.entities.size() - 1;
+
+            if (copy.classname == "light") {
+                for (size_t k = 0; k < lightEntityIndices.size(); k++) {
+                    if (lightEntityIndices[k] == idx) {
+                        PointLight pl = level.pointLights[k];
+                        pl.position = pos;
+                        level.pointLights.push_back(pl);
+                        lightEntityIndices.push_back(nidx);
+                        lightDirty.push_back(true);
+                        break;
+                    }
+                }
+            }
+            else if (copy.classname == "info_player_start") {
+                level.playerStart = pos;
+                level.hasPlayerStart = true;
+            }
+
+            reloadEntityModel(nidx);
+            added.push_back(nidx);
+        }
+        setSelection(added);
+        cout << "Editor: duplicated " << added.size() << " entit(y/ies)\n";
+    };
+
+    // reloadEntityModel() above frees + reloads. For hot-reload we restore the
+    // full pipeline state to match boot: entities, rotations/scales, models,
+    // lighting sidecar, scene bounds, chunks, grid, camera start and editor state
+    // (selection + undo history are discarded - indices all changed).
+    // Runs on EVERY reload: frees every GL resource then rebuilds from the file.
+    auto reloadFromDisk = [&]() {
+        // Free chunk VAOs/VBOs + their textures (Texture has no free(): the
+        // GL name is destroyed via glDeleteTextures using the public id()).
+        for (auto& c : chunks) {
+            if (c.VAO) glDeleteVertexArrays(1, &c.VAO);
+            if (c.VBO) glDeleteBuffers(1, &c.VBO);
+            GLuint t = c.texture.id();
+            if (t) glDeleteTextures(1, &t);
+        }
+        chunks.clear();
+        for (auto& m : entityModels)
+            m.freeGPU();
+
+        // Free grid buffers.
+        if (gridVAO) glDeleteVertexArrays(1, &gridVAO);
+        if (gridVBO) glDeleteBuffers(1, &gridVBO);
+        gridVAO = gridVBO = 0;
+        gridVerts.clear();
+
+        // Re-parse the map (same call as boot; throws are caught there).
+        LevelData fresh;
+        try {
+            fresh = MapLoader::load(MAP_PATH, textureSizeLookup);
+        }
+        catch (const std::exception& e) {
+            cerr << "Editor: hot-reload FAILED - " << e.what() << "\n";
+            return;
+        }
+        catch (...) {
+            cerr << "Editor: hot-reload FAILED (unknown)\n";
+            return;
+        }
+        level = fresh;
+
+        // Rebuild per-entity parallel arrays exactly like boot.
+        lightEntityIndices.clear();
+        for (size_t i = 0; i < level.entities.size(); i++)
+            if (level.entities[i].classname == "light") lightEntityIndices.push_back((int)i);
+        lightDirty.assign(lightEntityIndices.size(), false);
+        entityDirty.assign(level.entities.size(), false);
+        propsDirty.assign(level.entities.size(), false);
+
+        entityRot.assign(level.entities.size(), glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+        entityScale.assign(level.entities.size(), 1.0f);
+        for (size_t i = 0; i < level.entities.size(); i++) {
+            const MapEntity& ent = level.entities[i];
+            auto ait = ent.properties.find("angles");
+            if (ait != ent.properties.end()) {
+                vector<float> a = parseVec3(ait->second);
+                if (a.size() >= 3) entityRot[i] = eulerToQuat(a[0], a[1], -a[2]);
+                else if (a.size() >= 1) entityRot[i] = eulerToQuat(0.0f, a[0], 0.0f);
+            }
+            else {
+                auto git = ent.properties.find("angle");
+                if (git != ent.properties.end())
+                    entityRot[i] = eulerToQuat(0.0f, parseAngleValue(git->second, 0.0f), 0.0f);
+            }
+            auto sit = ent.properties.find("scale");
+            if (sit != ent.properties.end()) {
+                float sc = parseAngleValue(sit->second, 1.0f);
+                entityScale[i] = sc > 0.0001f ? sc : 1.0f;
+            }
+        }
+
+        entityModels.assign(level.entities.size(), ObjMesh());
+        entityHasModel.assign(level.entities.size(), false);
+        for (size_t i = 0; i < level.entities.size(); i++) reloadEntityModel((int)i);
+
+        // Color normalization pass (mirror of boot) so 0-255 colors re-normalize.
+        for (size_t k = 0; k < lightEntityIndices.size(); k++) {
+            int idx = lightEntityIndices[k];
+            auto cit = level.entities[idx].properties.find("color");
+            if (cit == level.entities[idx].properties.end()) continue;
+            glm::vec3 rawColor = parseColorFromString(cit->second);
+            if (rawColor.x > 1.01f || rawColor.y > 1.01f || rawColor.z > 1.01f) {
+                glm::vec3 norm = rawColor / 255.0f;
+                level.pointLights[k].color = norm;
+                cit->second = fmt3(norm);
+                lightDirty[k] = true;
+            }
+        }
+
+        lighting = LightingState();
+        loadLightingSidecar(MAP_PATH, lighting);
+
+        sceneMin = glm::vec3(1e9f);
+        sceneMax = glm::vec3(-1e9f);
+        for (size_t i = 0; i + 2 < level.collisionVertices.size(); i += 3) {
+            glm::vec3 p(level.collisionVertices[i], level.collisionVertices[i + 1], level.collisionVertices[i + 2]);
+            sceneMin = glm::min(sceneMin, p);
+            sceneMax = glm::max(sceneMax, p);
+        }
+        sceneCenter = (sceneMin + sceneMax) * 0.5f;
+        sceneRadius = glm::length(sceneMax - sceneMin) * 0.5f;
+        if (sceneRadius < 1.0f) sceneRadius = 20.0f;
+
+        // Rebuild chunk VAOs/VBOs.
+        for (auto& pair : level.renderChunks) {
+            const string& texName = pair.first;
+            vector<float>& data = pair.second;
+            if (data.empty()) continue;
+            LevelChunk chunk;
+            chunk.texture.load(TEXTURES_FOLDER + texName + ".png");
+            chunk.vertexCount = (int)(data.size() / 8);
+            glGenVertexArrays(1, &chunk.VAO);
+            glGenBuffers(1, &chunk.VBO);
+            glBindVertexArray(chunk.VAO);
+            glBindBuffer(GL_ARRAY_BUFFER, chunk.VBO);
+            glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), data.data(), GL_STATIC_DRAW);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+            glEnableVertexAttribArray(2);
+            chunks.push_back(chunk);
+        }
+
+        // Rebuild ground grid.
+        float half = sceneRadius * 1.5f;
+        float step = sceneRadius / 5.0f;
+        for (float g = -half; g <= half + 0.01f; g += step) {
+            gridVerts.insert(gridVerts.end(), { -half, 0.0f, g, half, 0.0f, g });
+            gridVerts.insert(gridVerts.end(), { g, 0.0f, -half, g, 0.0f, half });
+        }
+        glGenVertexArrays(1, &gridVAO);
+        glGenBuffers(1, &gridVBO);
+        glBindVertexArray(gridVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, gridVBO);
+        glBufferData(GL_ARRAY_BUFFER, gridVerts.size() * sizeof(float), gridVerts.data(), GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        // Reset camera to player start (or centre) + wipe selection/undo -
+        // every entity index changed, old snapshots would corrupt the state.
+        if (level.hasPlayerStart)
+            camera.position = level.playerStart + glm::vec3(0.0f, 1.0f, 0.0f);
+        else
+            camera.position = sceneCenter + glm::vec3(0.0f, 0.5f, sceneRadius);
+        clearSelection();
+        undoStack.clear();
+        redoStack.clear();
+        cout << "Editor: map reloaded from disk (" << level.entities.size()
+            << " entities, " << chunks.size() << " chunks)\n";
     };
 
     // Undo capture for continuous-edit widgets (sliders, color edits): the frame
@@ -1703,6 +2343,30 @@ int main() {
         camera.processKeyboard(window, dt);
         camera.updateVectors();
 
+        // Hot-reload: when autoReload is on, poll the .map's write time once a
+        // second. If it changed AND nothing unsaved is pending in memory, rebuild
+        // everything from the file (see reloadFromDisk()). The check runs before
+        // the ImGui frame so the freshly-loaded geometry is drawn this frame.
+        if (s_editorSettings.autoReload && now - g_lastReloadCheck > 1.0) {
+            g_lastReloadCheck = now;
+            ULONGLONG t = fileWriteTimeOf(MAP_PATH);
+            if (t != 0 && t != g_mapWriteTime) {
+                bool dirty = false;
+                for (bool b : lightDirty) { if (b) { dirty = true; break; } }
+                if (!dirty) for (bool b : entityDirty) { if (b) { dirty = true; break; } }
+                if (!dirty) for (bool b : propsDirty) { if (b) { dirty = true; break; } }
+                if (!dirty && !postState.dirty) {
+                    g_mapWriteTime = t;
+                    reloadFromDisk();
+                }
+                else {
+                    cout << "Editor: .map changed on disk but unsaved edits in memory "
+                        "exist - auto-reload skipped (Ctrl+R to force).\n";
+                    g_mapWriteTime = t;
+                }
+            }
+        }
+
         // K toggles sun shadows (visual confirmation that they track sun movement).
         bool kDown = glfwGetKey(window, GLFW_KEY_K) == GLFW_PRESS;
         if (kDown && !kWasDown) shadowsEnabled = !shadowsEnabled;
@@ -1719,6 +2383,47 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         ImGuizmo::BeginFrame();  // must be called right after NewFrame
+
+        // ------------------------------------------------------------------
+        // Main menu bar (File / Edit / View). Fits the dock space's work area
+        // automatically via ImGui's viewport work-rect handling (the dock space
+        // is built over WorkPos/WorkSize, which this shrinks by one bar height).
+        // ------------------------------------------------------------------
+        {
+            bool ctrl = ImGui::GetIO().KeyCtrl;  // used by accelerators listed below
+            if (ImGui::BeginMainMenuBar()) {
+                if (ImGui::BeginMenu("File")) {
+                    if (ImGui::MenuItem("Save", "Ctrl+S")) saveAll();
+                    if (ImGui::MenuItem("Reload Map", "Ctrl+R")) {
+                        reloadFromDisk();
+                        g_mapWriteTime = fileWriteTimeOf(MAP_PATH);
+                    }
+                    ImGui::MenuItem("Auto-Reload", nullptr, &s_editorSettings.autoReload);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Exit", "Escape")) glfwSetWindowShouldClose(window, GLFW_TRUE);
+                    ImGui::EndMenu();
+                }
+                if (ImGui::BeginMenu("Edit")) {
+                    if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !undoStack.empty())) doUndo();
+                    if (ImGui::MenuItem("Redo", "Ctrl+Y", false, !redoStack.empty())) doRedo();
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Select All", "Ctrl+A")) selectAllEntities();
+                    if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !selection.empty())) duplicateSelectedEntities();
+                    if (ImGui::MenuItem("Delete", "Delete", false, !selection.empty())) deleteSelectedEntities();
+                    ImGui::EndMenu();
+                }
+                if (ImGui::BeginMenu("View")) {
+                    if (ImGui::MenuItem("Grid", nullptr, &s_editorSettings.showGrid)) {}
+                    if (ImGui::MenuItem("Wireframe", "Z", &s_editorSettings.wireframe)) {}
+                    if (ImGui::MenuItem("Orthographic", "P", &s_editorSettings.ortho)) {}
+                    if (ImGui::MenuItem("Snap", "G", &s_editorSettings.snapEnabled)) {}
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Snap Settings", nullptr, &s_snapPanelOpen)) {}
+                    ImGui::EndMenu();
+                }
+                ImGui::EndMainMenuBar();
+            }
+        }
 
         // Full-window DockSpace hosts all panels (Nuake-style multi-panel layout).
         ImGuiID dockspace = ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
@@ -1743,6 +2448,7 @@ int main() {
             ImGui::DockBuilderDockWindow("Entities", left);
             ImGui::DockBuilderDockWindow("Map Info", bottomNode);
             ImGui::DockBuilderDockWindow("FGD Classes", bottomNode);
+            ImGui::DockBuilderDockWindow("Snap Settings", bottomNode);
             ImGui::DockBuilderDockWindow("Properties", propsNode);
             ImGui::DockBuilderDockWindow("Lighting", rightBottomNode);
             ImGui::DockBuilderDockWindow("Post-Processing & Pipeline Settings", rightBottomNode);
@@ -1793,7 +2499,15 @@ int main() {
         ImGui::SameLine();
         if (ImGui::Button("Redo")) doRedo();
         ImGui::SameLine();
-        ImGui::TextDisabled("1/2/3 op  T local/world  G snap  F frame  Ctrl+Z/Y undo/redo");
+        if (ImGui::Button("Save")) { saveAll(); g_mapWriteTime = fileWriteTimeOf(MAP_PATH); }
+        ImGui::SameLine();
+        ImGui::Checkbox("Grid", &s_editorSettings.showGrid);
+        ImGui::SameLine();
+        ImGui::Checkbox("Wire", &s_editorSettings.wireframe);
+        ImGui::SameLine();
+        ImGui::Checkbox("Ortho", &s_editorSettings.ortho);
+        ImGui::SameLine();
+        ImGui::TextDisabled("1/2/3 op  T local/world  G snap  Del delete  Ctrl+S/D/Z/Y/R  Z/P view  F frame");
         ImGui::PopStyleVar();
         ImGui::EndChild();
         ImGui::PopStyleColor();
@@ -1813,7 +2527,7 @@ int main() {
         float gx = imgPos.x;
         float gy = imgPos.y;
         ImGuizmo::SetRect(gx, gy, (float)vpW, (float)vpH);
-        ImGuizmo::SetOrthographic(false);
+        ImGuizmo::SetOrthographic(s_editorSettings.ortho);
         auto inImage = [&](const ImVec2& p) {
             return p.x >= gx && p.x < gx + vpW && p.y >= gy && p.y < gy + vpH;
         };
@@ -1846,7 +2560,19 @@ int main() {
             glViewport(0, 0, vpW, vpH);
         }
 
-        glm::mat4 proj = glm::perspective(glm::radians(60.0f), (float)vpW / (float)vpH, 0.1f, 2000.0f);
+        // Orthographic keeps the gizmo/marker picking accurate: the projected half-size
+        // scales with the scene radius so a top-down ortho covers the whole map
+        // (fovy mirrors the default 60 deg perspective at that distance).
+        glm::mat4 proj;
+        if (s_editorSettings.ortho) {
+            float halfH = sceneRadius;
+            if (halfH < 1.0f) halfH = 1.0f;
+            float aspect = (float)vpW / (float)vpH;
+            proj = glm::ortho(-halfH * aspect, halfH * aspect, -halfH, halfH, 0.1f, 4000.0f);
+        }
+        else {
+            proj = glm::perspective(glm::radians(60.0f), (float)vpW / (float)vpH, 0.1f, 2000.0f);
+        }
         glm::mat4 view = camera.view();
         glm::mat4 vp = proj * view;
         glm::mat4 invProj = glm::inverse(proj);
@@ -1901,12 +2627,16 @@ int main() {
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
             // Grid.
-            glBindVertexArray(gridVAO);
-            glUseProgram(gridShader);
-            glUniformMatrix4fv(glGetUniformLocation(gridShader, "uMVP"), 1, GL_FALSE, &vp[0][0]);
-            glDrawArrays(GL_LINES, 0, (GLsizei)(gridVerts.size() / 3));
+            if (s_editorSettings.showGrid) {
+                glBindVertexArray(gridVAO);
+                glUseProgram(gridShader);
+                glUniformMatrix4fv(glGetUniformLocation(gridShader, "uMVP"), 1, GL_FALSE, &vp[0][0]);
+                glDrawArrays(GL_LINES, 0, (GLsizei)(gridVerts.size() / 3));
+            }
 
-            // Brush chunks.
+            // Brush chunks (wireframe mode draws them as a line overlay).
+            if (s_editorSettings.wireframe)
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
             glBindVertexArray(0);
             glUseProgram(chunkShader);
             glUniformMatrix4fv(glGetUniformLocation(chunkShader, "uMVP"), 1, GL_FALSE, &vp[0][0]);
@@ -1944,6 +2674,26 @@ int main() {
                 glBindVertexArray(chunk.VAO);
                 glDrawArrays(GL_TRIANGLES, 0, chunk.vertexCount);
             }
+
+            // OBJ model previews for mesh entities (FGD "model" key). Rendered
+            // with the same lit chunk shader so textures match the game; only
+            // models safely within the camera's clip range are drawn.
+            for (size_t i = 0; i < level.entities.size(); i++) {
+                if (i >= entityHasModel.size() || !entityHasModel[i]) continue;
+                if (entityModels[i].VAO == 0) continue;
+                const MapEntity& ent = level.entities[i];
+                if (ent.classname == "worldspawn") continue;
+                bool hasLivePos = (ent.classname == "light" || ent.classname == "info_player_start");
+                if (!hasLivePos && ent.properties.count("origin") == 0) continue;
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), entityEnginePos((int)i))
+                    * glm::mat4(entityRot[i])
+                    * glm::scale(glm::mat4(1.0f), glm::vec3(entityScale[i]));
+                glUniformMatrix4fv(glGetUniformLocation(chunkShader, "uMVP"), 1, GL_FALSE, &(vp * model)[0][0]);
+                glUniform1i(glGetUniformLocation(chunkShader, "uTexture"), 0);
+                entityModels[i].draw();
+            }
+            if (s_editorSettings.wireframe)
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
             // Point-entity markers (3D line boxes), oriented/scaled to the
             // entity's rotation/scale so rotate/scale gizmo edits are visible.
@@ -2042,12 +2792,32 @@ int main() {
             if (ImGui::IsKeyPressed(ImGuiKey_3, false)) s_editorSettings.gizmoOp = 2;
             if (ImGui::IsKeyPressed(ImGuiKey_T, false)) s_editorSettings.gizmoLocal = !s_editorSettings.gizmoLocal;
             if (ImGui::IsKeyPressed(ImGuiKey_G, false)) s_editorSettings.snapEnabled = !s_editorSettings.snapEnabled;
-            // Ctrl+Z undo / Ctrl+Y redo. Ignored mid-widget-drag (an active ImGui
-            // item such as a slider) so history can't be corrupted mid-edit.
+            // Z toggles wireframe, P toggles orthographic (non-ctrl only).
+            if (ImGui::IsKeyPressed(ImGuiKey_Z, false) && !ImGui::GetIO().KeyCtrl
+                && !ImGui::IsAnyItemActive()) s_editorSettings.wireframe = !s_editorSettings.wireframe;
+            if (ImGui::IsKeyPressed(ImGuiKey_P, false) && !ImGui::IsAnyItemActive())
+                s_editorSettings.ortho = !s_editorSettings.ortho;
+            // Delete = remove selected entities.
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !ImGui::IsAnyItemActive())
+                deleteSelectedEntities();
+            // Ctrl+Z undo / Ctrl+Y redo, Ctrl+S save, Ctrl+A select-all,
+            // Ctrl+D duplicate, Ctrl+R force reload. Ignored mid-widget-drag
+            // (an active ImGui item such as a slider) so history can't be
+            // corrupted mid-edit.
             bool ctrl = ImGui::GetIO().KeyCtrl;
             if (ctrl && !ImGui::IsAnyItemActive()) {
                 if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) doUndo();
                 if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) doRedo();
+                if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+                    saveAll();
+                    g_mapWriteTime = fileWriteTimeOf(MAP_PATH);
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_A, false)) selectAllEntities();
+                if (ImGui::IsKeyPressed(ImGuiKey_D, false)) duplicateSelectedEntities();
+                if (ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+                    reloadFromDisk();
+                    g_mapWriteTime = fileWriteTimeOf(MAP_PATH);
+                }
             }
         }
 
@@ -2145,9 +2915,16 @@ int main() {
             float snap[3];
             float* snapPtr = nullptr;
             if (s_editorSettings.snapEnabled) {
-                if (gizmoOp == ImGuizmo::TRANSLATE) { snap[0] = snap[1] = snap[2] = MAP_SCALE; }
-                else if (gizmoOp == ImGuizmo::ROTATE) { snap[0] = 15.0f; snap[1] = snap[2] = 0.0f; }
-                else { snap[0] = snap[1] = snap[2] = 0.1f; }
+                if (gizmoOp == ImGuizmo::TRANSLATE) {
+                    snap[0] = snap[1] = snap[2] = s_editorSettings.snapTranslate * MAP_SCALE;
+                }
+                else if (gizmoOp == ImGuizmo::ROTATE) {
+                    snap[0] = s_editorSettings.snapRotate;
+                    snap[1] = snap[2] = 0.0f;
+                }
+                else {
+                    snap[0] = snap[1] = snap[2] = s_editorSettings.snapScale;
+                }
                 snapPtr = snap;
             }
 
@@ -2234,16 +3011,46 @@ int main() {
         ImGui::BulletText("Shift = faster");
         ImGui::BulletText("K = toggle sun shadows (currently %s)", shadowsEnabled ? "ON" : "OFF");
         ImGui::BulletText("Ctrl+Z = undo, Ctrl+Y = redo");
+        ImGui::BulletText("Del = delete, Ctrl+D = duplicate, Ctrl+A = select all");
+        ImGui::BulletText("Z = wireframe, P = orthographic, G = snap");
+        ImGui::BulletText("Ctrl+S = save, Ctrl+R = reload, Escape = exit");
         ImGui::End();
+
+        if (s_snapPanelOpen) {
+            ImGui::Begin("Snap Settings", &s_snapPanelOpen);
+            ImGui::Checkbox("Snap enabled (G)", &s_editorSettings.snapEnabled);
+            ImGui::Separator();
+            ImGui::SliderFloat("Translate (map u)", &s_editorSettings.snapTranslate, 0.25f, 32.0f, "%.2f");
+            ImGui::SliderFloat("Rotate (deg)", &s_editorSettings.snapRotate, 1.0f, 90.0f, "%.0f");
+            ImGui::SliderFloat("Scale (mult)", &s_editorSettings.snapScale, 0.05f, 2.0f, "%.2f");
+            ImGui::Separator();
+            ImGui::Checkbox("Show grid", &s_editorSettings.showGrid);
+            ImGui::Checkbox("Wireframe (Z)", &s_editorSettings.wireframe);
+            ImGui::Checkbox("Orthographic (P)", &s_editorSettings.ortho);
+            ImGui::Separator();
+            ImGui::Checkbox("Auto-reload .map on disk change", &s_editorSettings.autoReload);
+            ImGui::End();
+        }
 
         ImGui::Begin("Entities");
         if (level.entities.empty()) {
             ImGui::Text("No entities found.");
         }
         else {
-            if (ImGui::BeginChild("entityList", ImVec2(0.0f, 220.0f), true)) {
+            // Entity search/filter box: filters the list by classname substring.
+            static char entFilter[64] = "";
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##entfilter", "Filter by classname...", entFilter, sizeof(entFilter));
+            string filterStr = entFilter;
+
+            if (ImGui::BeginChild("entityList", ImVec2(0.0f, 200.0f), true)) {
+                size_t shown = 0;
                 for (size_t i = 0; i < level.entities.size(); i++) {
                     const MapEntity& ent = level.entities[i];
+                    if (!filterStr.empty() && ent.classname.find(filterStr) == string::npos
+                        && std::to_string(i).find(filterStr) == string::npos)
+                        continue;
+                    shown++;
                     bool selected = isSelected((int)i);
                     string label = ent.classname.empty()
                         ? "(no classname) " + std::to_string(i)
@@ -2253,6 +3060,7 @@ int main() {
                         else selectOnly((int)i);
                     }
                 }
+                if (shown == 0) ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "(no matches)");
             }
             ImGui::EndChild();
 
@@ -2284,18 +3092,262 @@ int main() {
         if (fgd.loaded) {
             ImGui::Begin("FGD Classes");
             ImGui::Text("Loaded %zu entity classes", fgd.classes.size());
-            for (const FgdClass& cls : fgd.classes) {
-                if (ImGui::TreeNode(cls.name.c_str())) {
+
+            static char fgdFilter[64] = "";
+            ImGui::InputText("Filter", fgdFilter, sizeof(fgdFilter));
+
+            if (ImGui::BeginChild("fgdList", ImVec2(0.0f, 240.0f), true)) {
+                string filterStr = fgdFilter;
+                for (const FgdClass& cls : fgd.classes) {
+                    if (!filterStr.empty() && cls.name.find(filterStr) == string::npos) continue;
                     const char* typeName = "point";
                     if (cls.type == FgdClassType::Solid) typeName = "solid";
                     else if (cls.type == FgdClassType::Base) typeName = "base";
-                    ImGui::TextWrapped("Type: %s", typeName);
-                    if (!cls.description.empty()) ImGui::TextWrapped("%s", cls.description.c_str());
-                    ImGui::TreePop();
+                    string header = cls.name + "  [" + typeName + "]" +
+                        "  (" + std::to_string(cls.keyValues.size()) + " keys)";
+                    if (ImGui::TreeNode(header.c_str())) {
+                        if (cls.type != FgdClassType::Base && ImGui::Button("Add to map")) {
+                            addEntityFromClass(cls);
+                            ImGui::TreePop();
+                            continue;
+                        }
+                        if (!cls.description.empty()) ImGui::TextWrapped("%s", cls.description.c_str());
+                        if (cls.type != FgdClassType::Base)
+                            ImGui::TextWrapped("Drops a new entity 3 m in front of the camera.");
+                        ImGui::TreePop();
+                    }
                 }
             }
+            ImGui::EndChild();
+
+            ImGui::Separator();
+            ImGui::TextWrapped("Tip: add an entity, select it, then edit its key/values in the Properties panel.");
             ImGui::End();
         }
+
+        // ------------------------------------------------------------------
+        // Generic entity property panel. Renders the selected entity's key/
+        // values with FGD-aware widgets (choices list, flags, integers, text),
+        // lets the user add/remove arbitrary keys, and flags the entity so Save
+        // writes them back into the .map as generic keyvalues.
+        // ------------------------------------------------------------------
+        ImGui::Begin("Properties");
+        if (selectedEntity < 0 || selectedEntity >= (int)level.entities.size()) {
+            ImGui::TextWrapped("Select an entity in the Entities panel to edit its properties.");
+        }
+        else {
+            const int idx = selectedEntity;
+            MapEntity& ent = level.entities[idx];
+
+            ImGui::Text("%s  (entity #%d)", ent.classname.c_str(), idx);
+            const FgdClass* cls = fgd.find(ent.classname);
+            if (cls && !cls->description.empty())
+                ImGui::TextWrapped("%s", cls->description.c_str());
+
+            auto markProps = [&]() { propsDirty[idx] = true; };
+
+            // Flatten the FGD key set (incl. base(...) inherited keys) so we
+            // can render generic widget for the class's declared keys.
+            vector<const FgdKeyValue*> classKeys;
+            if (cls) {
+                for (const FgdKeyValue& kv : cls->keyValues) classKeys.push_back(&kv);
+                for (const string& b : cls->baseClasses) {
+                    const FgdClass* base = fgd.find(b);
+                    if (base)
+                        for (const FgdKeyValue& kv : base->keyValues) classKeys.push_back(&kv);
+                }
+            }
+            auto keyIsStructural = [&](const string& k) -> bool {
+                return k == "classname" || k == "origin" || k == "angles" ||
+                    k == "angle" || k == "scale";
+            };
+
+            ImGui::SeparatorText("Transform");
+            if (ent.properties.count("origin")) {
+                vector<float> o = parseVec3(ent.properties["origin"]);
+                if (o.size() < 3) o = { 0.0f, 0.0f, 0.0f };
+                bool changed = false;
+                changed |= ImGui::DragFloat("Pos X (map)", &o[0], 8.0f, -1e6f, 1e6f, "%.1f");
+                changed |= ImGui::DragFloat("Pos Y (map)", &o[1], 8.0f, -1e6f, 1e6f, "%.1f");
+                changed |= ImGui::DragFloat("Pos Z (map)", &o[2], 8.0f, -1e6f, 1e6f, "%.1f");
+                if (changed) {
+                    setEntityEnginePos(idx, mapOriginToEngine(glm::vec3(o[0], o[1], o[2])));
+                    markProps();
+                }
+            }
+            vector<float> ang = parseVec3(ent.properties.count("angles") ?
+                ent.properties.at("angles") : ent.properties.count("angle") ? ent.properties.at("angle") : "");
+            if (ent.properties.count("angles") || ent.properties.count("angle")) {
+                if (ang.size() < 3) ang.resize(3, 0.0f);
+                bool changed = false;
+                changed |= ImGui::DragFloat("Pitch (map)", &ang[0], 1.0f, -360.0f, 360.0f, "%.1f");
+                changed |= ImGui::DragFloat("Yaw (map)", &ang[1], 1.0f, -360.0f, 360.0f, "%.1f");
+                changed |= ImGui::DragFloat("Roll (map)", &ang[2], 1.0f, -360.0f, 360.0f, "%.1f");
+                if (changed) {
+                    ent.properties["angles"] = fmtDeg(ang[0]) + " " + fmtDeg(ang[1]) + " " + fmtDeg(ang[2]);
+                    ent.properties.erase("angle");
+                    entityRot[idx] = eulerToQuat(ang[0], ang[1], -ang[2]);
+                    entityDirty[idx] = true;
+                    markProps();
+                }
+            }
+            if (ent.properties.count("scale")) {
+                float sc = parseAngleValue(ent.properties["scale"], 1.0f);
+                if (ImGui::DragFloat("Scale", &sc, 0.01f, 0.0001f, 100.0f, "%.3f")) {
+                    entityScale[idx] = sc > 0.0001f ? sc : 1.0f;
+                    ent.properties["scale"] = std::to_string(sc);
+                    entityDirty[idx] = true;
+                    markProps();
+                }
+            }
+
+            ImGui::SeparatorText("Key / Values");
+            char buf[512];
+            bool keysChanged = false;
+
+            // FGD-declared keys with type-appropriate widgets.
+            vector<string> drawnKeys;
+            for (const FgdKeyValue* kv : classKeys) {
+                if (keyIsStructural(kv->key)) continue;
+                drawnKeys.push_back(kv->key);
+                string current = ent.properties.count(kv->key) ? ent.properties[kv->key] : "";
+                string label = kv->displayName.empty() ? kv->key : kv->displayName;
+
+                if (kv->isFlags) {
+                    int flagsVal = 0;
+                    {
+                        vector<float> v = parseVec3(current);
+                        if (!v.empty()) flagsVal = (int)v[0];
+                    }
+                    bool anyChanged = false;
+                    for (const FgdFlag& f : kv->flags) {
+                        string id = kv->key + "::flag_" + std::to_string(f.bit);
+                        bool on = (flagsVal & f.bit) != 0;
+                        if (ImGui::Checkbox((f.name + "##" + id).c_str(), &on)) {
+                            if (on) flagsVal |= f.bit;
+                            else flagsVal &= ~f.bit;
+                            anyChanged = true;
+                        }
+                    }
+                    if (anyChanged) {
+                        ent.properties[kv->key] = std::to_string(flagsVal);
+                        keysChanged = true;
+                    }
+                }
+                else if (kv->isChoices) {
+                    int currentIdx = -1;
+                    {
+                        vector<float> v = parseVec3(current);
+                        if (!v.empty()) {
+                            int iv = (int)v[0];
+                            for (size_t c = 0; c < kv->choices.size(); c++)
+                                if (kv->choices[c].first == iv) { currentIdx = (int)c; break; }
+                        }
+                    }
+                    if (ImGui::BeginCombo((label + "##" + kv->key).c_str(),
+                        currentIdx >= 0 ? kv->choices[currentIdx].second.c_str() : "" )) {
+                        for (size_t c = 0; c < kv->choices.size(); c++)
+                            if (ImGui::Selectable(kv->choices[c].second.c_str(), (int)c == currentIdx)) {
+                                ent.properties[kv->key] = std::to_string(kv->choices[c].first);
+                                keysChanged = true;
+                            }
+                        ImGui::EndCombo();
+                    }
+                }
+                else if (cls && kv->key == cls->modelPathKey) {
+                    // Model file browser: pick a .obj under GameRoot/models. The
+                    // value is the path relative to the models folder (e.g.
+                    // "props/crate.obj"), exactly what MODELS_FOLDER + key yields.
+                    const vector<string>& modelPaths = cachedObjModelPaths();
+                    int cur = -1;
+                    for (size_t m = 0; m < modelPaths.size(); m++)
+                        if (modelPaths[m] == current) { cur = (int)m; break; }
+                    string preview = cur >= 0 ? modelPaths[cur] : ("(none)");
+                    if (ImGui::BeginCombo((label + "##" + kv->key).c_str(), preview.c_str())) {
+                        if (ImGui::Selectable("(none)", cur < 0)) {
+                            ent.properties[kv->key] = "";
+                            keysChanged = true;
+                            entityHasModel[idx] = false;
+                        }
+                        for (size_t m = 0; m < modelPaths.size(); m++) {
+                            if (ImGui::Selectable(modelPaths[m].c_str(), (int)m == cur)) {
+                                ent.properties[kv->key] = modelPaths[m];
+                                keysChanged = true;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (ImGui::IsItemHovered() && !kv->description.empty())
+                        ImGui::SetTooltip("%s", kv->description.c_str());
+                }
+                else if (kv->type == "integer") {
+                    int iv = 0;
+                    {
+                        vector<float> v = parseVec3(current);
+                        if (!v.empty()) iv = (int)v[0];
+                    }
+                    if (ImGui::DragInt((label + "##" + kv->key).c_str(), &iv, 0.1f)) {
+                        ent.properties[kv->key] = std::to_string(iv);
+                        keysChanged = true;
+                    }
+                }
+                else {
+                    // Generic text / number / whatever - raw string editor.
+                    snprintf(buf, sizeof(buf), "%s", current.c_str());
+                    if (ImGui::InputText((label + "##" + kv->key).c_str(), buf, sizeof(buf))) {
+                        ent.properties[kv->key] = buf;
+                        keysChanged = true;
+                    }
+                }
+                if (ImGui::IsItemHovered() && !kv->description.empty())
+                    ImGui::SetTooltip("%s", kv->description.c_str());
+            }
+
+            // Any leftover raw keys not declared by the FGD (custom data) - also
+            // list keys that came from the file but aren't in classKeys so users
+            // can prune legacy/typo'd keyvalues.
+            ImGui::Separator();
+            for (auto kit = ent.properties.begin(); kit != ent.properties.end(); /**/) {
+                const string& k = kit->first;
+                bool handled = keyIsStructural(k) || std::find(drawnKeys.begin(), drawnKeys.end(), k) != drawnKeys.end();
+                if (!handled) {
+                    snprintf(buf, sizeof(buf), "%s", kit->second.c_str());
+                    bool edited = ImGui::InputText((k + "##raw").c_str(), buf, sizeof(buf));
+                    ImGui::SameLine();
+                    bool doDelete = ImGui::Button(("X##del_" + k).c_str());
+                    if (doDelete) { kit = ent.properties.erase(kit); keysChanged = true; continue; }
+                    if (edited) {
+                        kit->second = buf;
+                        keysChanged = true;
+                    }
+                }
+                ++kit;
+            }
+
+            if (keysChanged) {
+                markProps();
+                refreshEntityFromKeys(idx);
+                reloadEntityModel(idx);
+            }
+
+            ImGui::SeparatorText("Add Key");
+            static char newKeyBuf[64] = "";
+            static char newValBuf[256] = "";
+            ImGui::InputText("Key##newk", newKeyBuf, sizeof(newKeyBuf));
+            ImGui::InputText("Value##newv", newValBuf, sizeof(newValBuf));
+            if (ImGui::Button("Add key") && newKeyBuf[0]) {
+                string k = newKeyBuf;
+                if (ent.properties.count(k) == 0) {
+                    ent.properties[k] = newValBuf;
+                    markProps();
+                    newKeyBuf[0] = '\0';
+                }
+            }
+
+            if (propsDirty[idx])
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Modified - not saved");
+        }
+        ImGui::End();
 
         // ------------------------------------------------------------------
         // Lighting panel (Tier 1): sun, ambient, editable point lights.
@@ -2387,12 +3439,8 @@ int main() {
         ImGui::Separator();
 
         if (ImGui::Button("Save lighting, lights & moved entities")) {
-            saveLightingSidecar(MAP_PATH, lighting);
-            bool ok = saveLightEntitiesToMap(MAP_PATH, level.entities, lightEntityIndices, lightDirty);
-            bool okOr = saveEntityPropsToMap(MAP_PATH, level.entities, entityDirty);
-            cout << "Save: sidecar written, .map light entities "
-                << (ok ? "updated" : "FAILED") << ", entity transforms "
-                << (okOr ? "updated" : "FAILED") << "\n";
+            saveAll();
+            g_mapWriteTime = fileWriteTimeOf(MAP_PATH);
         }
         ImGui::TextWrapped("Save writes sun/ambient to %s and point-light + gizmo-moved keyvalues back into the .map file.",
             sidecarPathFor(MAP_PATH).c_str());
@@ -2441,6 +3489,38 @@ int main() {
         else
             ImGui::Text("Post-processing settings match the saved scene state.");
         ImGui::End();
+
+        // ------------------------------------------------------------------
+        // Status bar: derives the current world/editor state on the left and
+        // frame timing on the right. Lives in the main viewport bottom strip,
+        // below the dock space, so it never covers panel content.
+        // ------------------------------------------------------------------
+        {
+            ImGuiViewport* sbVp = ImGui::GetMainViewport();
+            bool barOpen = ImGui::BeginViewportSideBar("##StatusBar", sbVp, ImGuiDir_Down,
+                ImGui::GetFrameHeight(), ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoDecoration);
+            if (barOpen) {
+                bool dirtyAny = !lightDirty.empty() || !entityDirty.empty() || !propsDirty.empty();
+                ImGui::Text("%s", MAP_PATH.c_str());
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", s_editorSettings.autoReload ? "(auto-reload)" : "");
+                ImGui::SameLine();
+                ImGui::Text("| %zu sel", selection.size());
+                ImGui::SameLine();
+                const char* opName = s_editorSettings.gizmoOp == 1 ? "rotate" : (s_editorSettings.gizmoOp == 2 ? "scale" : "move");
+                ImGui::Text("| %s %s snap=%s", opName, s_editorSettings.gizmoLocal ? "local" : "world",
+                    s_editorSettings.snapEnabled ? "on" : "off");
+                ImGui::SameLine();
+                ImGui::Text("| view=%s",
+                    s_editorSettings.ortho ? "ortho" : "persp");
+                ImGui::SameLine();
+                if (dirtyAny || postState.dirty)
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "| * unsaved");
+                ImGui::SameLine();
+                ImGui::Text("| %5.1f FPS", ImGui::GetIO().Framerate);
+                ImGui::End();
+            }
+        }
 
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());

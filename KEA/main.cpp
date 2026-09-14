@@ -70,10 +70,12 @@
 #include <glad/glad.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <iostream>
 #include <vector>
 #include <map>
 #include <string>
+#include <sstream>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -93,6 +95,8 @@
 #include "jolt_world.h"
 #include "console.h"
 #include "fgd.h"
+#include "objmesh.h"
+#include "audio.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
@@ -130,6 +134,119 @@ const string MAP_PATH = workspaceRoot() + "/Maps/Testroom.map";
 const string FGD_PATH = workspaceRoot() + "/GameRoot/kea.fgd";
 const string CROSSHAIR_PATH = workspaceRoot() + "/Images/Crosshair.png";
 const string FONT_PATH = workspaceRoot() + "/oldschool_pc_font_pack_v2.2_FULL/ttf - Px (pixel outline)/Px437_IBM_VGA_8x16.ttf";
+const string MODELS_FOLDER = workspaceRoot() + "/GameRoot/models/";
+
+// ==========================================
+// Generic mesh-entity helpers
+// ==========================================
+// Any map entity whose FGD class declares model({ "path": <key> }) is loaded
+// from MODELS_FOLDER and placed in the world using the SAME conversions the
+// editor uses, so what you see in the editor matches the game:
+//   - origin:   map (z-up, in map units) -> engine (y-up, in metres)
+//   - rotation: map "Pitch Yaw Roll" -> engine quaternion (map roll is negated)
+//   - scale:    uniform, from the FGD-declared scale keyvalue (default 1)
+// The model matrix lives alongside the mesh so the render passes can draw it.
+// ==========================================
+
+static const float MAP_SCALE = 1.0f / 32.0f;
+
+static glm::vec3 mapOriginToEngine(const glm::vec3& mapOrigin) {
+    return glm::vec3(mapOrigin.x, mapOrigin.z, -mapOrigin.y) * MAP_SCALE;
+}
+
+// Engine rotation R = Ry(rollDeg) * Rz(yawDeg) * Rx(pitchDeg) - mirrors the
+// editor's eulerToQuat helper. Call with (pitch, yaw, -roll) for map angles.
+static glm::quat mapEulerToQuat(float pitchDeg, float yawDeg, float rollDeg) {
+    glm::mat4 R = glm::mat4(1.0f);
+    R = glm::rotate(R, glm::radians(rollDeg), glm::vec3(0.0f, 1.0f, 0.0f));   // Ry
+    R = glm::rotate(R, glm::radians(yawDeg), glm::vec3(0.0f, 0.0f, 1.0f));    // Rz
+    R = glm::rotate(R, glm::radians(pitchDeg), glm::vec3(1.0f, 0.0f, 0.0f));  // Rx
+    return glm::quat_cast(R);
+}
+
+static vector<float> parseFloatList(const string& s) {
+    vector<float> out;
+    stringstream ss(s);
+    float f;
+    while (ss >> f) out.push_back(f);
+    return out;
+}
+
+struct SpawnedProp {
+    ObjMesh mesh;
+    glm::mat4 modelMatrix = glm::mat4(1.0f);
+};
+
+// Loads every entity in `level` whose FGD class has a model path keyvalue.
+// Returns the props placed in ENGINE space (positions already scaled/rotated).
+static vector<SpawnedProp> spawnMeshEntities(const LevelData& level, const FgdFile& fgd) {
+    vector<SpawnedProp> props;
+
+    for (size_t i = 0; i < level.entities.size(); ++i) {
+        const MapEntity& ent = level.entities[i];
+        const FgdClass* cls = fgd.find(ent.classname);
+        if (!cls || cls->modelPathKey.empty()) continue;
+
+        auto mit = ent.properties.find(cls->modelPathKey);
+        if (mit == ent.properties.end() || mit->second.empty()) continue;
+
+        SpawnedProp sp;
+        string meshPath = MODELS_FOLDER + mit->second;
+        if (!sp.mesh.loadFromObj(meshPath, TEXTURES_FOLDER)) {
+            cout << "Failed to load model '" << meshPath << "' for entity "
+                << ent.classname << ": " << sp.mesh.error << "\n";
+            g_Console.logError("Failed to load model '" + meshPath + "' for entity "
+                + ent.classname + ": " + sp.mesh.error);
+            continue;
+        }
+
+        // Origin (map units -> engine metres).
+        glm::vec3 mapOrigin(0.0f);
+        auto oit = ent.properties.find("origin");
+        if (oit != ent.properties.end()) {
+            vector<float> o = parseFloatList(oit->second);
+            if (o.size() >= 3) mapOrigin = glm::vec3(o[0], o[1], o[2]);
+        }
+
+        // Rotation: "angles P Y R" overrides single-axis "angle" (Quake style).
+        glm::quat rot(1.0f, 0.0f, 0.0f, 0.0f);
+        auto ait = ent.properties.find("angles");
+        if (ait != ent.properties.end()) {
+            vector<float> a = parseFloatList(ait->second);
+            if (a.size() >= 3) rot = mapEulerToQuat(a[0], a[1], -a[2]);   // map roll = -engine roll
+            else if (a.size() >= 1) rot = mapEulerToQuat(0.0f, a[0], 0.0f);
+        }
+        else {
+            auto git = ent.properties.find("angle");
+            if (git != ent.properties.end()) {
+                vector<float> g = parseFloatList(git->second);
+                if (!g.empty()) rot = mapEulerToQuat(0.0f, g[0], 0.0f);
+            }
+        }
+
+        // Uniform scale from the FGD-declared keyvalue (fallback "scale").
+        float sc = 1.0f;
+        auto sit = ent.properties.find(cls->modelScaleKey.empty() ? "scale" : cls->modelScaleKey);
+        if (sit != ent.properties.end()) {
+            vector<float> s = parseFloatList(sit->second);
+            if (!s.empty() && s[0] > 0.0001f) sc = s[0];
+        }
+
+        glm::mat4 m = glm::mat4(1.0f);
+        m = glm::translate(m, mapOriginToEngine(mapOrigin));
+        m = m * glm::mat4_cast(rot);
+        m = glm::scale(m, glm::vec3(sc));
+        sp.modelMatrix = m;
+
+        cout << "Spawned mesh entity '" << ent.classname << "' -> " << meshPath
+            << " (" << sp.mesh.vertexCount << " verts)\n";
+        g_Console.log("Spawned mesh entity '" + ent.classname + "' -> " + meshPath);
+
+        props.push_back(sp);
+    }
+
+    return props;
+}
 
 // ==========================================
 // SHADER SOURCE CODES
@@ -599,6 +716,10 @@ int main() {
         + " sunColor=(" + std::to_string(lighting.sunColor.r) + ", "
         + std::to_string(lighting.sunColor.g) + ", " + std::to_string(lighting.sunColor.b) + ")");
 
+    // Generic mesh-entity spawn: any entity whose FGD class declares a model
+    // path keyvalue becomes a runtime-placed, collidable, shadow-casting prop.
+    vector<SpawnedProp> props = spawnMeshEntities(level, fgd);
+
     glm::vec3 sceneMin(1e9f), sceneMax(-1e9f);
     for (size_t i = 0; i + 2 < level.collisionVertices.size(); i += 3) {
         glm::vec3 p(level.collisionVertices[i], level.collisionVertices[i + 1], level.collisionVertices[i + 2]);
@@ -635,8 +756,17 @@ int main() {
         chunks.push_back(chunk);
     }
 
+    for (auto& sp : props) {
+        if (!sp.mesh.uploadToGPU())
+            g_Console.logError("ObjMesh GPU upload failed: " + sp.mesh.error);
+    }
+
     CollisionMesh collisionMesh;
     collisionMesh.buildFromVertices(level.collisionVertices.data(), level.collisionVertices.size());
+    for (const auto& sp : props) {
+        vector<float> triSoup = sp.mesh.collisionVertices();
+        collisionMesh.addFromVertices(triSoup.data(), triSoup.size(), sp.modelMatrix);
+    }
 
     if (level.hasPlayerStart) {
         player.position = level.playerStart;
@@ -873,6 +1003,28 @@ int main() {
         }
     });
 
+    // Audio: playsound <file> [volume] [loop]
+    // Plays a sound file relative to GameRoot/audio/. Use volume 0..1 and "loop" to repeat.
+    g_Console.registerCommand("playsound", [](const vector<string>& a) {
+        if (a.size() < 1) {
+            g_Console.log("usage: playsound <filename> [volume 0..1] [loop]");
+            return;
+        }
+        string path = workspaceRoot() + "/GameRoot/audio/" + a[0];
+        float vol = (a.size() >= 2) ? stof(a[1]) : 1.0f;
+        bool loop = (a.size() >= 3 && (a[2] == "loop" || a[2] == "1"));
+        AudioHandle h = play(path, vol, loop);
+        if (h != AUDIO_INVALID) {
+            g_Console.log("Playing '" + path + "' (handle " + to_string(h) + ")");
+        } else {
+            g_Console.logError("Failed to play '" + path + "'");
+        }
+    });
+
+    // Audio system init (miniaudio device).
+    if (!audioInit()) g_Console.logError("Audio: init failed");
+    else g_Console.log("Audio system ready");
+
     while (!window.shouldClose()) {
         float currentFrame = (float)glfwGetTime();
         deltaTime = currentFrame - lastFrame;
@@ -935,6 +1087,8 @@ int main() {
             camera.position = player.position + glm::vec3(0.0f, player.getEyeHeight(), 0.0f);
         }
 
+        audioUpdate(camera.position, camera.front, camera.up);
+
         glm::mat4 view = camera.getViewMatrix();
         glm::mat4 projection = glm::perspective(glm::radians(75.0f),
             (float)window.width() / (float)window.height(), 0.1f, 100.0f);
@@ -950,6 +1104,11 @@ int main() {
         for (auto& chunk : chunks) {
             glBindVertexArray(chunk.VAO);
             glDrawArrays(GL_TRIANGLES, 0, chunk.vertexCount);
+        }
+        for (const auto& sp : props) {
+            shadowMap.depthShader()->setMat4("model", sp.modelMatrix);
+            glBindVertexArray(sp.mesh.VAO);
+            glDrawArrays(GL_TRIANGLES, 0, sp.mesh.vertexCount);
         }
         glCullFace(GL_BACK);
         shadowMap.endRender(window.width(), window.height());
@@ -990,10 +1149,16 @@ int main() {
                     glClear(GL_DEPTH_BUFFER_BIT);
 
                     pointShadowShader.setMat4("shadowMatrix", shadowTransforms[f]);
+                    pointShadowShader.setMat4("model", identityModel);
 
                     for (auto& chunk : chunks) {
                         glBindVertexArray(chunk.VAO);
                         glDrawArrays(GL_TRIANGLES, 0, chunk.vertexCount);
+                    }
+                    for (const auto& sp : props) {
+                        pointShadowShader.setMat4("model", sp.modelMatrix);
+                        glBindVertexArray(sp.mesh.VAO);
+                        glDrawArrays(GL_TRIANGLES, 0, sp.mesh.vertexCount);
                     }
                 }
             }
@@ -1023,6 +1188,11 @@ int main() {
             glBindVertexArray(chunk.VAO);
             glDrawArrays(GL_TRIANGLES, 0, chunk.vertexCount);
         }
+        for (const auto& sp : props) {
+            gbufferShader.setMat4("model", sp.modelMatrix);
+            sp.mesh.draw();
+        }
+        gbufferShader.setMat4("model", identityModel);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
         // 4. SSAO Pass (half-res, bilateral blur)
@@ -1260,5 +1430,8 @@ int main() {
         glDeleteVertexArrays(1, &chunk.VAO);
         glDeleteBuffers(1, &chunk.VBO);
     }
+
+    audioShutdown();
+
     return 0;
 }

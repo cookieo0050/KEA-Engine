@@ -69,6 +69,25 @@ void CollisionMesh::buildFromVertices(const float* vertices, size_t floatCount, 
     buildGrid();
 }
 
+void CollisionMesh::addFromVertices(const float* vertices, size_t floatCount, const glm::mat4& modelMatrix) {
+    size_t vertCount = floatCount / 3;
+
+    for (size_t i = 0; i + 2 < vertCount; i += 3) {
+        auto toVec3 = [&](size_t idx) {
+            glm::vec4 p(vertices[idx * 3], vertices[idx * 3 + 1], vertices[idx * 3 + 2], 1.0f);
+            p = modelMatrix * p;
+            return glm::vec3(p);
+            };
+        Triangle tri;
+        tri.v0 = toVec3(i);
+        tri.v1 = toVec3(i + 1);
+        tri.v2 = toVec3(i + 2);
+        m_triangles.push_back(tri);
+    }
+
+    buildGrid();
+}
+
 int64_t CollisionMesh::cellKey(int cx, int cy, int cz) {
     return (int64_t)(cx & 0x1FFFF) | ((int64_t)(cy & 0x1FFFF) << 17) | ((int64_t)(cz & 0x1FFFF) << 34);
 }

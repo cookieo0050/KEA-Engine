@@ -144,6 +144,8 @@
     <ClCompile Include="jolt_world.cpp" />
     <ClCompile Include="console.cpp" />
     <ClCompile Include="renderpipeline.cpp" />
+    <ClCompile Include="objmesh.cpp" />
+    <ClCompile Include="audio.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="imgui\imgui.h" />
@@ -177,6 +179,8 @@
     <ClInclude Include="jolt_world.h" />
     <ClInclude Include="console.h" />
     <ClInclude Include="renderpipeline.h" />
+    <ClInclude Include="objmesh.h" />
+    <ClInclude Include="audio.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

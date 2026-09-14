@@ -25,6 +25,11 @@ struct CollisionContact {
 class CollisionMesh {
 public:
     void buildFromVertices(const float* vertices, size_t floatCount, const glm::mat4& modelMatrix = glm::mat4(1.0f));
+    // Appends more triangles (optionally transformed by modelMatrix) to an
+    // existing mesh and rebuilds the spatial grid. Used to merge runtime-spawned
+    // entity meshes into the world collision after the level's static geometry
+    // has been built.
+    void addFromVertices(const float* vertices, size_t floatCount, const glm::mat4& modelMatrix = glm::mat4(1.0f));
     RaycastHit raycast(const glm::vec3& origin, const glm::vec3& dir, float maxDistance = 1000.0f) const;
     
     // Sweep a capsule along a direction and return the FIRST contact against the mesh.

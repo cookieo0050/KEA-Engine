@@ -12,6 +12,10 @@ public:
     int width() const { return m_width; }
     int height() const { return m_height; }
 
+    // True once load() actually decoded an image (a failed load leaves the
+    // object with id != 0 but zero dimensions).
+    bool valid() const { return m_id != 0 && m_width > 0; }
+
     static glm::ivec2 getImageSize(const std::string& path);
 
 private:
